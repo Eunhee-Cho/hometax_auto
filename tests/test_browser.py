@@ -171,3 +171,129 @@ def test_no_data_selector_only_applies_when_visible(runtime):
     assert not c.no_data(job(5))
     page.locator('#empty').evaluate('e=>e.hidden=false')
     assert c.no_data(job(5))
+
+
+def websquare_form():
+    return '''<label for="biz">사업자등록번호</label><input id="biz" title="사업자등록번호">
+    <table><tr><th>과세기간(년/기)</th><td>
+    <input id="year" title="과세연도" value="2025" maxlength="4">
+    <div id="term" class="w2selectbox" onclick="document.getElementById('choices').hidden=false">
+       <input readonly title="기수" class="w2selectbox_label" value="1기"></div>
+    </td></tr></table>
+    <div id="choices" class="w2selectbox_layer" hidden><table><tr><td onclick="document.querySelector('#term input').value='2기';document.getElementById('choices').hidden=true">2기</td></tr></table></div>
+    <input type="radio" id="early" name="filing"><label for="early">예정</label>
+    <input type="radio" id="final" name="filing"><label for="final">확정</label>
+    <button onclick="setTimeout(()=>{document.getElementById('result').innerText=document.getElementById('biz').value+' 2026 2기 예정 결과';document.getElementById('result').hidden=false},250)">조회</button>
+    <button>인쇄하기</button><div id="result" hidden></div>'''
+
+
+def test_websquare_readonly_custom_term_selects_and_reads_back(runtime):
+    c,ctx,page,tmp=runtime;serve(page,websquare_form())
+    c.set_field(job(),'기수','2기')
+    assert page.locator('#term input').input_value()=='2기'
+    assert not page.locator('#choices').is_visible()
+
+
+def test_custom_selection_that_does_not_update_is_rejected(runtime):
+    c,ctx,page,tmp=runtime
+    serve(page,websquare_form().replace("document.querySelector('#term input').value='2기';",''))
+    with pytest.raises(RuntimeError,match='선택값 확인 실패'):c.set_field(job(),'기수','2기')
+
+
+def test_hover_menu_with_async_submenu_and_punctuation(runtime,monkeypatch):
+    c,ctx,page,tmp=runtime;c.args.mode='auto'
+    monkeypatch.setattr('builtins.input',lambda *a:pytest.fail('auto 모드에서 입력 대기'))
+    html='''<a onmouseenter="setTimeout(()=>document.getElementById('common').hidden=false,100)">세무대리·납세관리</a>
+    <a id="common" hidden onmouseenter="setTimeout(()=>document.getElementById('vat').hidden=false,100)">세무대리 공통조회</a>
+    <a id="vat" hidden onclick="document.getElementById('form').hidden=false">부가가치세 신고도움서비스</a>
+    <div id="form" hidden>'''+websquare_form()+'</div>'
+    serve(page,html)
+    c.navigate(job())
+    assert page.locator('#form').is_visible()
+    assert c.active_service==1
+
+
+def test_auto_query_without_enter_waits_for_result_and_marks_identity_unverified(runtime,monkeypatch):
+    c,ctx,page,tmp=runtime;c.args.mode='auto'
+    monkeypatch.setattr('builtins.input',lambda *a:pytest.fail('auto 모드에서 입력 대기'))
+    serve(page,websquare_form())
+    assert c.configure_query(job()) is False
+    assert page.locator('#result').is_visible()
+    assert '1234567890' in page.locator('#result').inner_text()
+    assert page.locator('#year').input_value()=='2026'
+    assert page.locator('#term input').input_value()=='2기'
+
+
+def test_auto_missing_control_fails_without_query_or_enter(runtime,monkeypatch):
+    c,ctx,page,tmp=runtime;c.args.mode='auto'
+    monkeypatch.setattr('builtins.input',lambda *a:pytest.fail('auto 모드에서 입력 대기'))
+    serve(page,websquare_form().replace('title="기수"','title="unknown"').replace('<th>과세기간(년/기)</th>','<th>unknown</th>'))
+    with pytest.raises(RuntimeError,match='기수'):c.configure_query(job())
+    assert not page.locator('#result').is_visible()
+
+
+def test_auto_stale_result_without_response_or_change_is_not_accepted(runtime,monkeypatch):
+    c,ctx,page,tmp=runtime;c.args.mode='auto';c.args.timeout=1
+    monkeypatch.setattr('builtins.input',lambda *a:pytest.fail('auto 모드에서 입력 대기'))
+    serve(page,websquare_form().replace("setTimeout(()=>{document.getElementById('result').innerText=document.getElementById('biz').value+' 2026 2기 예정 결과';document.getElementById('result').hidden=false},250)",''))
+    with pytest.raises(RuntimeError,match='조회 완료'):c.configure_query(job())
+
+
+def test_period_reset_by_another_control_is_rejected_before_query(runtime):
+    c,ctx,page,tmp=runtime;c.args.mode='auto'
+    html=websquare_form().replace('title="사업자등록번호"','title="사업자등록번호" onblur="document.getElementById(\'early\').checked=false"')
+    serve(page,html)
+    with pytest.raises(RuntimeError,match='신고구분'):c.configure_query(job())
+    assert not page.locator('#result').is_visible()
+
+
+def test_diagnostics_capture_structure_not_taxpayer_values(runtime):
+    c,ctx,page,tmp=runtime;serve(page,websquare_form())
+    page.locator('#biz').fill('1234567890')
+    target=tmp/'out';target.mkdir()
+    path=c.save_diagnostics(job(),target,RuntimeError('기수 선택 실패'))
+    text=path.read_text()
+    assert '1234567890' not in text
+    assert 'w2selectbox' in text and '기수 선택 실패' in text
+
+
+def test_two_clients_auto_menu_query_report_pipeline_without_enter(runtime,monkeypatch):
+    c,ctx,page,tmp=runtime;c.args.mode='auto'
+    monkeypatch.setattr('builtins.input',lambda *a:pytest.fail('auto 모드에서 입력 대기'))
+    def save_test_pdf():
+        writer=PdfWriter();writer.add_blank_page(width=300,height=300)
+        dest=c.incoming/('new_'+str(len(list(c.incoming.iterdir())))+'.pdf')
+        with dest.open('wb') as f:writer.write(f)
+    ctx.expose_function('saveTestPDF',save_test_pdf)
+    report='''<button title="인쇄" onclick="document.getElementById('modal').hidden=false">프린터</button>
+        <div id="modal" hidden><input type="radio" id="all"><label for="all">전체페이지</label>
+        <button onclick="saveTestPDF()">인쇄</button></div>'''
+    ctx.route('**/clipreport',lambda route:route.fulfill(content_type='text/html; charset=utf-8',body=report))
+    html='''<a onmouseenter="document.getElementById('common').hidden=false">세무대리납세관리</a>
+    <a id="common" hidden onmouseenter="document.getElementById('vat').hidden=false">세무대리 공통 조회</a>
+    <a id="vat" hidden onclick="document.getElementById('form').hidden=false">부가가치세 신고도움 서비스</a>
+    <div id="form" hidden>'''+websquare_form().replace('<button>인쇄하기</button>',"<button onclick=\"window.open('/clipreport')\">인쇄하기</button>")+'</div>'
+    serve(page,html)
+    other=ctx.new_page();other.goto('about:blank')
+    first=job()
+    second=replace(first,client=replace(first.client,company='다른거래처',biz='9999999999'),
+                   filters={**first.filters,'사업자등록번호':'9999999999'})
+    for index,item in enumerate((first,second)):
+        target=tmp/str(index);target.mkdir()
+        artifacts,confirmed,note=c.collect(item,target)
+        assert confirmed is False and '미확인' in note
+        assert len(artifacts)==1 and artifacts[0]['source']=='clipreport_print'
+        assert validate_artifact(Path(artifacts[0]['path']))['pages']==1
+        assert item.client.biz in page.locator('#result').inner_text()
+    assert not other.is_closed()
+    assert not any('/clipreport' in p.url for p in ctx.pages)
+
+
+def test_http_error_does_not_treat_stale_output_as_query_success(runtime):
+    c,ctx,page,tmp=runtime;c.args.mode='auto'
+    page.route('**/query',lambda route:route.fulfill(status=500,body='error'))
+    html=websquare_form().replace("setTimeout(()=>{document.getElementById('result').innerText=document.getElementById('biz').value+' 2026 2기 예정 결과';document.getElementById('result').hidden=false},250)","fetch('/query')")
+    # query를 제외한 문서만 fixture로 대체합니다.
+    page.route('**/local-test',lambda route:route.fulfill(content_type='text/html; charset=utf-8',body=html))
+    page.goto('https://www.hometax.go.kr/local-test')
+    with pytest.raises(RuntimeError,match='조회 요청이 실패'):c.configure_query(job())
