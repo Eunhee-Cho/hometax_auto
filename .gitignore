@@ -1,0 +1,8 @@
+.venv/
+.chrome-profile/
+다운로드/
+__pycache__/
+.pytest_cache/
+INPUT-부가세_확장.xlsx
+*.zip
+INPUT-부가세.xlsx
